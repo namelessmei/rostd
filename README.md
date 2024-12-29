@@ -19,3 +19,7 @@ A library that contains essential and useful modules to make a Roblox game.
 ### Serdes
 
 - [X] Protobuf
+
+### Utils
+
+- [X] Signal
