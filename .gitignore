@@ -1,6 +1,10 @@
 # Project place file
-/roblox-std.rbxlx
+/rostd.rbxlx
 
 # Roblox Studio lock files
 /*.rbxlx.lock
 /*.rbxl.lock
+
+.zed/
+build/
+.DS_Store

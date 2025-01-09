@@ -8,41 +8,41 @@ export type Connection<T...> = {
     _prev: Connection<T...>?,
     _signal: Signal<T...>,
     _args: { unknown }?,
-    Disconnect: (self: Connection<T...>) -> ()
+    disconnect: (self: Connection<T...>) -> ()
 }
 
 export type Signal<T...> = {
     _head: Connection<T...>?,
-    Connect: (self: Signal<T...>, fn: (T...) -> ()) -> Connection<T...>,
-    Once: (self: Signal<T...>, fn: (T...) -> ()) -> Connection<T...>,
-    Fire: (self: Signal<T...>, T...) -> (),
-    Destroy: (self: Signal<T...>) -> ()
+    connect: (self: Signal<T...>, fn: (T...) -> ()) -> Connection<T...>,
+    once: (self: Signal<T...>, fn: (T...) -> ()) -> Connection<T...>,
+    fire: (self: Signal<T...>, T...) -> (),
+    destroy: (self: Signal<T...>) -> ()
 }
 
 local THREAD_POOL_SIZE = 256
-local freeThreads = table.create(THREAD_POOL_SIZE)
+local free_threads = table.create(THREAD_POOL_SIZE)
 
-local function RunCallback(callback, thread, ...)
+local function run_callback<T...>(callback: (T...) -> (), thread: thread, ...: T...): ()
     callback(...)
-    table.insert(freeThreads, thread)
+    table.insert(free_threads, thread)
 end
 
-local function Yielder()
+local function yielder()
     while true do
-        RunCallback(coroutine.yield())
+        run_callback(coroutine.yield())
     end
 end
 
 for _ = 1, THREAD_POOL_SIZE do
-    local thread = coroutine.create(Yielder)
+    local thread = coroutine.create(yielder)
     coroutine.resume(thread)
-    table.insert(freeThreads, thread)
+    table.insert(free_threads, thread)
 end
 
 local Connection = {}
 Connection.__index = Connection
 
-function Connection.Disconnect<T...>(self: Connection<T...>)
+function Connection.disconnect<T...>(self: Connection<T...>)
     if not self._connected then 
         return 
     end
@@ -70,14 +70,14 @@ function Signal.new<T...>(): Signal<T...>
     return self :: any
 end
 
-function Signal.Connect<T...>(self: Signal<T...>, fn: (T...) -> ()): Connection<T...>
+function Signal.connect<T...>(self: Signal<T...>, fn: (T...) -> ()): Connection<T...>
     local cn: any = setmetatable({
         _connected = true,
         _signal = self,
         _fn = fn,
         _next = self._head,
         _prev = false,
-        Disconnect = Connection.Disconnect
+        disconnect = Connection.disconnect
     }, Connection)
     
     if self._head then
@@ -89,22 +89,22 @@ end
 
 function Signal.Once<T...>(self: Signal<T...>, fn: (T...) -> ()): Connection<T...>
     local cn
-    cn = self:Connect(function(...)
+    cn = self:connect(function(...)
         if not cn._connected then 
             return
         end
-        cn:Disconnect()
+        cn:disconnect()
         fn(...)
     end)
     return cn
 end
 
-function Signal.Fire<T...>(self: Signal<T...>, ...)
+function Signal.fire<T...>(self: Signal<T...>, ...)
     local cn = self._head
     local args = { ... }
     while cn do
         if cn._connected then
-            local thread = table.remove(freeThreads) :: thread
+            local thread = table.remove(free_threads) :: thread
             if not cn._args then
                 task.spawn(thread, cn._fn, thread, args)
             else
@@ -125,7 +125,7 @@ function Signal.Fire<T...>(self: Signal<T...>, ...)
     end
 end
 
-function Signal.Destroy<T...>(self: Signal<T...>)
+function Signal.destroy<T...>(self: Signal<T...>)
     local cn = self._head
     while cn do
         cn._connected = false

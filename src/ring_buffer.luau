@@ -8,23 +8,23 @@ export type Container<T> = {
 	_size: number,
 	_capacity: number,
 	new: (capacity: number?) -> Container<T>,
-	Push: (self: Container<T>, value: T) -> boolean,
-	Pop: (self: Container<T>) -> T?,
-	IsEmpty: (self: Container<T>) -> boolean,
-	IsFull: (self: Container<T>) -> boolean,
-	Contains: (self: Container<T>, value: T) -> boolean,
-	IndexOf: (self: Container<T>, value: T) -> number,
-	Clear: (self: Container<T>) -> (),
-	Peek: (self: Container<T>) -> T?,
-	GetSize: (self: Container<T>) -> number,
-	GetCapacity: (self: Container<T>) -> number,
-	ToArray: (self: Container<T>) -> { T },
+	push: (self: Container<T>, value: T) -> boolean,
+	pop: (self: Container<T>) -> T?,
+	is_empty: (self: Container<T>) -> boolean,
+	is_full: (self: Container<T>) -> boolean,
+	contains: (self: Container<T>, value: T) -> boolean,
+	index_of: (self: Container<T>, value: T) -> number,
+	clear: (self: Container<T>) -> (),
+	peek: (self: Container<T>) -> T?,
+	get_size: (self: Container<T>) -> number,
+	get_capacity: (self: Container<T>) -> number,
+	to_array: (self: Container<T>) -> { T },
 }
 
 local Container = {}
 Container.__index = Container
 
-local function NextPowerOfTwo(n: number): number
+local function next_pow_of_2(n: number): number
 	n = n - 1
 	n = bit32.bor(n, bit32.rshift(n, 1))
 	n = bit32.bor(n, bit32.rshift(n, 2))
@@ -36,7 +36,7 @@ end
 
 function Container.new<T>(capacity: number?): Container<T>
 	local requestedCapacity = capacity or 32
-	local actualCapacity = NextPowerOfTwo(requestedCapacity)
+	local actualCapacity = next_pow_of_2(requestedCapacity)
 
 	local self = setmetatable({}, Container)
 	self._buffer = table.create(actualCapacity)
@@ -47,8 +47,8 @@ function Container.new<T>(capacity: number?): Container<T>
 	return self :: any
 end
 
-function Container.Push<T>(self: Container<T>, value: T): boolean
-	if self:IsFull() then
+function Container.push<T>(self: Container<T>, value: T): boolean
+	if self:is_full() then
 		return false
 	end
 	self._buffer[self._tail + 1] = value
@@ -57,8 +57,8 @@ function Container.Push<T>(self: Container<T>, value: T): boolean
 	return true
 end
 
-function Container.Pop<T>(self: Container<T>): T?
-	if self:IsEmpty() then
+function Container.pop<T>(self: Container<T>): T?
+	if self:is_empty() then
 		return nil
 	end
 	local value = self._buffer[self._head + 1]
@@ -69,22 +69,22 @@ function Container.Pop<T>(self: Container<T>): T?
 end
 
 function Container.Peek<T>(self: Container<T>): T?
-	if self:IsEmpty() then
+	if self:is_empty() then
 		return nil
 	end
 	return self._buffer[self._head + 1]
 end
 
-function Container.IsEmpty<T>(self: Container<T>): boolean
+function Container.is_empty<T>(self: Container<T>): boolean
 	return self._size == 0
 end
 
-function Container.IsFull<T>(self: Container<T>): boolean
+function Container.is_full<T>(self: Container<T>): boolean
 	return self._size == self._capacity
 end
 
-function Container.Contains<T>(self: Container<T>, value: T): boolean
-	if self:IsEmpty() then
+function Container.contains<T>(self: Container<T>, value: T): boolean
+	if self:is_empty() then
 		return false
 	end
 
@@ -100,8 +100,8 @@ function Container.Contains<T>(self: Container<T>, value: T): boolean
 	return false
 end
 
-function Container.IndexOf<T>(self: Container<T>, value: T): number
-	if self:IsEmpty() then
+function Container.index_of<T>(self: Container<T>, value: T): number
+	if self:is_empty() then
 		return -1
 	end
 
@@ -117,23 +117,23 @@ function Container.IndexOf<T>(self: Container<T>, value: T): number
 	return -1
 end
 
-function Container.Clear<T>(self: Container<T>): ()
+function Container.clear<T>(self: Container<T>): ()
 	table.clear(self._buffer)
 	self._head = 0
 	self._tail = 0
 	self._size = 0
 end
 
-function Container.GetSize<T>(self: Container<T>): number
+function Container.get_size<T>(self: Container<T>): number
 	return self._size
 end
 
-function Container.GetCapacity<T>(self: Container<T>): number
+function Container.get_capacity<T>(self: Container<T>): number
 	return self._capacity
 end
 
-function Container.ToArray<T>(self: Container<T>): { T }
-	if self:IsEmpty() then
+function Container.to_array<T>(self: Container<T>): { T }
+	if self:is_empty() then
 		return {}
 	end
 
