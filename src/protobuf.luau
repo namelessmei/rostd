@@ -1,296 +1,339 @@
---!strict
 --!optimize 2
+--!native
+--!strict
 
-export type FieldType = "varint" | "string" | "message" | "map"
-export type WireType = number
+local bit = bit32
+local band, bor, lshift, rshift = bit.band, bit.bor, bit.lshift, bit.rshift
+local floor, abs = math.floor, math.abs
+local char, byte, sub = string.char, string.byte, string.sub
+local concat, insert = table.concat, table.insert
 
-export type SchemaField<T = any, K = any, V = any> = {
-	id: number,
-	type: FieldType,
-	wireType: WireType,
-	messageSchema: Schema<T>?,
-	keyType: FieldType?,
-	valueType: FieldType?,
-	_valueType: V
+local TYPE = {
+	NIL = 0,
+	NUMBER = 1,
+	BOOL = 2,
+	STRING = 3,
+	TABLE = 4,
+	ARRAY = 5,
+	STRING_REF = 6,
+	RLE = 7
 }
 
-export type Schema<T = any> = { [string]: any }
+local NUMBER_FORMAT = {
+	INT32 = 0,
+	FLOAT = 1
+}
 
-local WIRE_VARINT = 0
-local WIRE_STRING = 2
+local SHORT_STRING_MAX = 31
+local MEDIUM_STRING_MAX = 255
+local RLE_MIN_LENGTH = 4
 
-local function EncodeVarint(num: number): string
-	local bytes: { number } = {}
-	while num >= 0x80 do
-		table.insert(bytes, bit32.bor(bit32.band(num, 0x7F), 0x80))
-		num = bit32.rshift(num, 7)
+local function write_varint(binary: { string }, value: number)
+	while value >= 0x80 do
+		insert(binary, char(bor(band(value, 0x7F), 0x80)))
+		value = rshift(value, 7)
 	end
-	table.insert(bytes, num)
-	return string.char(unpack(bytes))
+	insert(binary, char(value))
 end
 
-local function EncodeString(str: string): string
-	return EncodeVarint(#str) .. str
+local function read_varint(str: string, offset: number): (number, number)
+	local result, shift = 0, 0
+	local b
+	repeat
+		b = byte(str, offset)
+		result = bor(result, lshift(band(b, 0x7F), shift))
+		shift = shift + 7
+		offset = offset + 1
+	until band(b, 0x80) == 0
+	return result, offset
 end
 
-local function EncodeLengthPrefixed(bytes: string): string
-	return EncodeVarint(#bytes) .. bytes
+local encode_nil = function(): string
+	return char(lshift(TYPE.NIL, 5)) 
 end
 
-local function DecodeVarint(bytes: string, offset: number): (number, number)
-	local result = 0
-	local shift = 0
-	local pos = offset
+local decode_nil = function(_: string, offset: number): (nil, number)
+	return nil, offset + 1 
+end
 
-	while true do
-		local byte = string.byte(bytes, pos)
-		if not byte then 
-			error("Incomplete varint")
+local encode_bool = function(value: boolean): string
+	return char(bor(lshift(TYPE.BOOL, 5), value and 1 or 0))
+end
+
+local decode_bool = function(binary_str: string, offset: number): (boolean, number)
+	return band(byte(binary_str, offset), 1) == 1, offset + 1
+end
+
+local function encode_number(num: number): string
+	if num % 1 == 0 and abs(num) <= 0x7FFFFFFF then
+		local binary = {
+			char(bor(lshift(TYPE.NUMBER, 5), num < 0 and 0x10 or 0)),
+			char(NUMBER_FORMAT.INT32)
+		}
+		write_varint(binary, abs(num))
+		return concat(binary)
+	end
+	return char(bor(lshift(TYPE.NUMBER, 5), num < 0 and 0x10 or 0)) ..
+		char(NUMBER_FORMAT.FLOAT) ..
+		string.pack("<d", num)
+end
+
+local function decode_number(binary_str: string, offset: number): (number, number)
+	local is_negative = band(byte(binary_str, offset), 0x10) ~= 0
+	local format = byte(binary_str, offset + 1)
+
+	if format == NUMBER_FORMAT.INT32 then
+		local magnitude, new_offset = read_varint(binary_str, offset + 2)
+		return (is_negative and -magnitude or magnitude), new_offset
+	end
+	return string.unpack("<d", sub(binary_str, offset + 2, offset + 9)), offset + 10
+end
+
+local function encode_string(str: string, string_pool: { string }): string
+	local len = #str
+	local ref_index = table.find(string_pool, str)
+	if len <= SHORT_STRING_MAX then
+		return char(bor(lshift(TYPE.STRING, 5), len)) .. str
+	end
+
+	if ref_index then
+		local header = char(lshift(TYPE.STRING_REF, 5))
+		local ref = ref_index > 255 
+			and string.pack("<H", ref_index - 1) 
+			or char(ref_index - 1)
+		return header .. ref
+	end
+
+	if len <= MEDIUM_STRING_MAX then
+		return char(bor(lshift(TYPE.STRING, 5), 0)) .. char(len) .. str
+	end
+
+	table.insert(string_pool, str)
+	local ref_i = #string_pool
+	local header = char(lshift(TYPE.STRING_REF, 5))
+	local ref = ref_i > 255 
+		and string.pack("<H", ref_i - 1) 
+		or char(ref_i - 1)
+	return header .. ref
+end
+
+local function decode_string(binary_str: string, offset: number, string_pool: { string }): (string, number)
+	local header = byte(binary_str, offset)
+	if not header then
+		error(string.format("Failed to read header byte at offset %d", offset))
+	end
+	local type_bits = rshift(header, 5)
+
+	if type_bits == TYPE.STRING then
+		local len = band(header, 0x1F)
+		if len == 0 then
+			return "", offset + 1
 		end
-		pos += 1
 
-		result = bit32.bor(result, bit32.lshift(bit32.band(byte, 0x7F), shift))
-
-		if bit32.band(byte, 0x80) == 0 then
-			break
+		local str = sub(binary_str, offset + 1, offset + len)
+		if #str ~= len then
+			error(string.format("String length mismatch: expected %d, got %d", len, #str))
 		end
-
-		shift += 7
+		return str, offset + len + 1
 	end
 
-	return result, pos
-end
-
-local function DecodeString(bytes: string, offset: number): (string, number)
-	local length, pos = DecodeVarint(bytes, offset)
-	if pos + length - 1 > #bytes then 
-		error("String extends beyond buffer")
-	end
-	return string.sub(bytes, pos, pos + length - 1), pos + length
-end
-
-local function field_<T>(id: number, fieldType: FieldType, messageSchema: Schema<T>?): SchemaField<T>
-	if fieldType == "message" and not messageSchema then
-		error("Message type requires schema")
-	end
-
-	return {
-		id = id,
-		type = fieldType,
-		wireType = if fieldType == "varint" then WIRE_VARINT else WIRE_STRING,
-		messageSchema = messageSchema,
-		keyType = nil,
-		valueType = nil,
-		_valueType = nil :: any
-	}
-end
-
-local function map_<K, V>(
-	id: number, 
-	keyType: FieldType, 
-	valueType: FieldType, 
-	messageSchema: Schema<V>?
-): SchemaField<any, K, V>
-	if not ({string = true, varint = true})[keyType] then
-		error("Map keys must be string or varint")
-	end
-
-	if not ({varint = true, string = true, message = true, map = true})[valueType] then
-		error("Invalid map value type")
-	end
-
-	if (valueType == "message" or valueType == "map") and not messageSchema then
-		error("Message/Map value type requires schema")
-	end
-
-	return {
-		id = id,
-		type = "map",
-		wireType = WIRE_STRING,
-		messageSchema = messageSchema,
-		keyType = keyType,
-		valueType = valueType
-	} :: any
-end
-
-export type Protobuf<T> = {
-	schema: Schema<T>,
-	EncodeField: (self: Protobuf<T>, field: SchemaField<T>, value: any) -> string,
-	DecodeField: (self: Protobuf<T>, field: SchemaField<T>, bytes: string, offset: number) -> (any, number),
-	Serialize: (self: Protobuf<T>, data: T) -> string,
-	Deserialize: (self: Protobuf<T>, bytes: string) -> T
-} & typeof(setmetatable({}, {}))
-
-local Protobuf = {}
-Protobuf.__index = Protobuf
-
-function Protobuf.new<T>(schema: Schema<T>): Protobuf<T>
-	local self = setmetatable({
-		schema = schema
-	}, Protobuf) :: any
-	return self
-end
-
-function Protobuf:EncodeField(field: SchemaField<any>, value: any): string
-	local bytes = EncodeVarint(bit32.bor(bit32.lshift(field.id, 3), field.wireType))
-
-	if field.type == "varint" then
-		if typeof(value) ~= "number" then
-			error(`Expected number for varint field, got {type(value)}`)
+	if type_bits == TYPE.STRING_REF then
+		local next_byte = byte(binary_str, offset + 1)
+		if not next_byte then
+			error(string.format("Failed to read reference byte at offset %d", offset + 1))
 		end
-		bytes ..= EncodeVarint(value)
-
-	elseif field.type == "string" then
-		if typeof(value) ~= "string" then
-			error(`Expected string field, got {type(value)}`)
-		end
-		bytes ..= EncodeString(value)
-
-	elseif field.type == "message" and field.messageSchema then
-		if typeof(value) ~= "table" then
-			error(`Expected table for message field, got {type(value)}`)
-		end
-		local nested = Protobuf.new(field.messageSchema)
-		bytes ..= EncodeLengthPrefixed(nested:Serialize(value))
-
-	elseif field.type == "map" and field.keyType and field.valueType then
-		if type(value) ~= "table" then
-			error(`Expected table for map field, got {typeof(value)}`)
-		end
-		local mapBytes = {}
-
-		for k, v in value :: any do
-			local entryBytes = {}
-
-			if field.keyType == "string" then
-				if typeof(k) ~= "string" then
-					error(`Expected string key in map, got {type(k)}`)
-				end
-				table.insert(entryBytes, EncodeString(k))
-			else
-				if typeof(k) ~= "number" then
-					error(`Expected number key in map, got {type(k)}`)
-				end
-				table.insert(entryBytes, EncodeVarint(k))
+		if next_byte > 255 then
+			local ref_index = string.unpack("<H", sub(binary_str, offset + 1, offset + 2)) + 1
+			if not string_pool[ref_index] then
+				error(string.format("Invalid string reference: %d (pool size: %d)", ref_index, #string_pool))
 			end
-
-			if field.valueType == "string" then
-				if typeof(v) ~= "string" then
-					error(`Expected string value in map, got {type(v)}`)
-				end
-				table.insert(entryBytes, EncodeString(v))
-			elseif field.valueType == "varint" then
-				if typeof(v) ~= "number" then
-					error(`Expected number value in map, got {type(v)}`)
-				end
-				table.insert(entryBytes, EncodeVarint(v))
-			elseif field.valueType == "message" and field.messageSchema then
-				if typeof(v) ~= "table" then
-					error(`Expected table value in map, got {type(v)}`)
-				end
-				local nested = Protobuf.new(field.messageSchema)
-				table.insert(entryBytes, EncodeLengthPrefixed(nested:Serialize(v)))
+			return string_pool[ref_index], offset + 3
+		else
+			local ref_index = next_byte + 1
+			if not string_pool[ref_index] then
+				error(string.format("Invalid string reference: %d (pool size: %d)", ref_index, #string_pool))
 			end
-
-			table.insert(mapBytes, table.concat(entryBytes))
+			return string_pool[ref_index], offset + 2
 		end
-
-		bytes ..= EncodeLengthPrefixed(table.concat(mapBytes))
 	end
-
-	return bytes
+	error(string.format("Invalid string type bits: %d at offset %d", type_bits, offset))
 end
 
-function Protobuf:DecodeField(field: SchemaField<any>, bytes: string, offset: number): (any, number)
-	if field.type == "varint" then
-		return DecodeVarint(bytes, offset)
-
-	elseif field.type == "string" then
-		return DecodeString(bytes, offset)
-
-	elseif field.type == "message" and field.messageSchema then
-		local length, pos = DecodeVarint(bytes, offset)
-		local messageBytes = string.sub(bytes, pos, pos + length - 1)
-		local nested = Protobuf.new(field.messageSchema)
-		return nested:Deserialize(messageBytes), pos + length
-
-	elseif field.type == "map" and field.keyType and field.valueType then
-		local length, pos = DecodeVarint(bytes, offset)
-		local mapBytes = string.sub(bytes, pos, pos + length - 1)
-		local mapPos = 1
-		local result = {}
-
-		while mapPos <= #mapBytes do
-			local key: any, value: any
-
-			if field.keyType == "string" then
-				key, mapPos = DecodeString(mapBytes, mapPos)
-			else
-				key, mapPos = DecodeVarint(mapBytes, mapPos)
-			end
-
-			if field.valueType == "string" then
-				value, mapPos = DecodeString(mapBytes, mapPos)
-			elseif field.valueType == "varint" then
-				value, mapPos = DecodeVarint(mapBytes, mapPos)
-			elseif field.valueType == "message" and field.messageSchema then
-				local messageLength
-				messageLength, mapPos = DecodeVarint(mapBytes, mapPos)
-				local messageBytes = string.sub(mapBytes, mapPos, mapPos + messageLength - 1)
-				local nested = Protobuf.new(field.messageSchema)
-				value = nested:Deserialize(messageBytes)
-				mapPos += messageLength
-			end
-
-			result[key] = value
+function is_array<T>(tbl: { T }): (boolean, number)
+	local len = 0
+	for k, _ in tbl do
+		if type(k) ~= "number" or k ~= floor(k) or k < 1 then
+			return false, 0
 		end
-
-		return result, pos + length
+		len = math.max(len, k)
 	end
-
-	error("Invalid field type")
+	for i = 1, len do
+		if tbl[i] == nil then return false, 0 end
+	end
+	return true, len
 end
 
-function Protobuf:Serialize<T>(data: T): string
-	local bytes = {}
-
-	for fieldName, f in self.schema :: Schema<T> do
-		if (data :: any)[fieldName] ~= nil then
-			table.insert(bytes, self:EncodeField(f, (data :: any)[fieldName]))
-		end
+local function try_rle<T>(arr: { T }, start: number): (boolean, number, any)
+	local value = arr[start]
+	local length = 1
+	local i = start + 1
+	while i <= #arr and arr[i] == value do
+		length += 1
+		i += 1
 	end
-
-	return table.concat(bytes)
+	return length >= RLE_MIN_LENGTH, length, value
 end
 
-function Protobuf:Deserialize<T>(bytes: string): T
-	local pos = 1
-	local result = {} :: any
+local function encode_array<T>(arr: { T }, string_pool: { string }): string
+	local binary = {}
+	insert(binary, char(lshift(TYPE.ARRAY, 5)))
+	write_varint(binary, #arr)
 
-	while pos <= #bytes do
-		local tag, newPos = DecodeVarint(bytes, pos)
-		local fieldNum = bit32.rshift(tag, 3)
-		pos = newPos
-
-		local fieldName, fi
-		for name, f in self.schema :: Schema<T> do
-			if f.id == fieldNum then
-				fieldName = name
-				fi = f
-				break
-			end
-		end
-
-		if fieldName and fi then
-			result[fieldName], pos = self:DecodeField(fi, bytes, pos)
+	local i = 1
+	while i <= #arr do
+		local can_rle, rle_len, rle_value = try_rle(arr, i)
+		if can_rle then
+			insert(binary, char(lshift(TYPE.RLE, 5)))
+			write_varint(binary, rle_len)
+			insert(binary, encode_value(rle_value, string_pool))
+			i += rle_len
+		else
+			insert(binary, encode_value(arr[i], string_pool))
+			i += 1
 		end
 	end
 
-	return result :: T
+	return concat(binary)
+end
+
+function encode_table<T>(tbl: { T }, string_pool: { string }): string
+	local is_arr, _ = is_array(tbl)
+	if is_arr then
+		return encode_array(tbl, string_pool)
+	end
+
+	local binary = {}
+	local count = 0
+	local keys = {}
+	for k, _ in tbl do
+		count += 1
+		insert(keys, k)
+	end
+
+	table.sort(keys, function(a, b)
+		local ta, tb = type(a), type(b)
+		if ta ~= tb then
+			return ta < tb
+		end
+		return a < b
+	end)
+
+	insert(binary, char(lshift(TYPE.TABLE, 5)))
+	write_varint(binary, count)
+
+	for _, k in keys do
+		insert(binary, encode_value(k, string_pool))
+		insert(binary, encode_value(tbl[k], string_pool))
+	end
+
+	return concat(binary)
+end
+
+function decode_array(binary_str: string, offset: number, length: number, string_pool: { string }): ({ any }, number)
+	local arr = {}
+	local idx = offset
+
+	local i = 1
+	while i <= length do
+		local val_type = rshift(byte(binary_str, idx), 5)
+
+		if val_type == TYPE.RLE then
+			local run_length
+			run_length, idx = read_varint(binary_str, idx + 1)
+			local value
+			value, idx = decode_value(binary_str, idx, string_pool)
+			for j = 1, run_length do
+				arr[i + j - 1] = value
+			end
+			i += run_length
+		else
+			local value
+			value, idx = decode_value(binary_str, idx, string_pool)
+			arr[i] = value
+			i += 1
+		end
+	end
+
+	return arr, idx
+end
+
+function decode_table(binary_str: string, offset: number, string_pool: { string }): ({ any }, number)
+	local type_byte = byte(binary_str, offset)
+	local is_arr = type_byte == lshift(TYPE.ARRAY, 5)
+	local idx = offset + 1
+	local count
+	count, idx = read_varint(binary_str, idx)
+
+	if is_arr then
+		return decode_array(binary_str, idx, count, string_pool)
+	end
+
+	local tbl = {}
+	for _ = 1, count do
+		local key, value
+		key, idx = decode_value(binary_str, idx, string_pool)
+		value, idx = decode_value(binary_str, idx, string_pool)
+		tbl[key] = value
+	end
+
+	return tbl, idx
+end
+
+function encode_value(v: any, string_pool: { string }): string
+	local t = typeof(v)
+	if t == "nil" then 
+		return encode_nil()
+	elseif t == "boolean" then 
+		return encode_bool(v)
+	elseif t == "number" then 
+		return encode_number(v)
+	elseif t == "string" then 
+		return encode_string(v, string_pool)
+	elseif t == "table" then 
+		return encode_table(v, string_pool)
+	else
+		error(string.format("Unsupported type: %s", t))
+	end
+end
+
+function decode_value(binary_str: string, offset: number, string_pool: { string }): (any, number)
+	local val_type = rshift(byte(binary_str, offset), 5)
+	if val_type == TYPE.NIL then 
+		return decode_nil(binary_str, offset)
+	elseif val_type == TYPE.BOOL then 
+		return decode_bool(binary_str, offset)
+	elseif val_type == TYPE.NUMBER then 
+		return decode_number(binary_str, offset)
+	elseif val_type == TYPE.STRING or val_type == TYPE.STRING_REF then 
+		return decode_string(binary_str, offset, string_pool)
+	elseif val_type == TYPE.TABLE or val_type == TYPE.ARRAY then 
+		return decode_table(binary_str, offset, string_pool)
+	end
+
+	error(string.format("Unknown type: %d", val_type))
+end
+
+local string_pool = {}
+
+local function encode(value: any): string
+	return encode_value(value, string_pool)
+end
+
+local function decode(binary_str: string, offset: number?): any
+	return decode_value(binary_str, offset or 1, string_pool)
 end
 
 return {
-	new = Protobuf.new,
-	field = field_,
-	map = map_
+	encode = encode,
+	decode = decode
 }
